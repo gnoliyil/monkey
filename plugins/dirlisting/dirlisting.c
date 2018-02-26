@@ -2,7 +2,7 @@
 
 /*  Monkey HTTP Server
  *  ==================
- *  Copyright 2001-2017 Eduardo Silva <eduardo@monkey.io>
+ *  Copyright 2001-2015 Monkey Software LLC <eduardo@monkey.io>
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -38,10 +38,8 @@ const mk_ptr_t mk_dir_iov_dash  = mk_ptr_init("-");
 const mk_ptr_t mk_dir_iov_none  = mk_ptr_init("");
 const mk_ptr_t mk_dir_iov_slash = mk_ptr_init("/");
 
-void mk_dirhtml_cb_body_rows(struct mk_stream_input *in);
-
 /* Function wrote by Max (Felipe Astroza), thanks! */
-static char *mk_dirhtml_human_readable_size(char *buf, size_t size, int len)
+static char *mk_dirhtml_human_readable_size(char *buf, size_t size, size_t len)
 {
     unsigned long u = 1024, i;
     static const char *__units[] = {
@@ -50,7 +48,7 @@ static char *mk_dirhtml_human_readable_size(char *buf, size_t size, int len)
     };
 
     for (i = 0; __units[i] != NULL; i++) {
-        if ((size / u) == 0) {
+        if ((len / u) == 0) {
             break;
         }
         u *= 1024;
@@ -177,7 +175,7 @@ int mk_dirhtml_read_config(char *path)
     struct file_info finfo;
 
     mk_api->str_build(&default_file, &len, "%sdirhtml.conf", path);
-    conf = mk_api->config_open(default_file);
+    conf = mk_api->config_create(default_file);
     if (!conf) {
         return -1;
     }
@@ -614,13 +612,10 @@ void mk_dirhtml_cleanup(struct mk_dirhtml_request *req)
     req = NULL;
 }
 
-void mk_dirhtml_cb_complete(struct mk_stream_input *in)
+void mk_dirhtml_cb_complete(struct mk_stream *stream)
 {
-    struct mk_stream *stream;
-    struct mk_dirhtml_request *req;
+    struct mk_dirhtml_request *req = stream->data;
 
-    stream = in->stream;
-    req = stream->context;
     if (req) {
         mk_dirhtml_cleanup(req);
     }
@@ -631,7 +626,7 @@ void mk_dirhtml_cb_error(struct mk_stream *stream, int status)
 #ifndef TRACE
     (void) status;
 #endif
-    struct mk_dirhtml_request *req = stream->context;
+    struct mk_dirhtml_request *req = stream->data;
 
     PLUGIN_TRACE("exception: %i", status);
 
@@ -640,20 +635,13 @@ void mk_dirhtml_cb_error(struct mk_stream *stream, int status)
     }
 }
 
-void mk_dirhtml_cb_chunk_body_rows(struct mk_stream_input *in, long bytes)
-{
-    (void) bytes;
-
-    mk_dirhtml_cb_body_rows(in);
-}
-
-void mk_dirhtml_cb_body_rows(struct mk_stream_input *in)
+void mk_dirhtml_cb_body_rows(struct mk_stream *stream)
 {
     int len;
     char tmp[16];
-    struct mk_stream *stream = in->stream;
-    struct mk_dirhtml_request *req = stream->context;
-    void (*cb_ok)(struct mk_stream_input *) = NULL;
+    struct mk_dirhtml_request *req = stream->data;
+    struct mk_channel *channel = stream->channel;
+    void (*cb_ok)(struct mk_stream* ) = NULL;
 
     if (req->iov_entry) {
         mk_api->iov_free(req->iov_entry);
@@ -664,25 +652,33 @@ void mk_dirhtml_cb_body_rows(struct mk_stream_input *in)
         if (req->chunked) {
             len = snprintf(tmp, sizeof(tmp), "%x\r\n",
                            (int) req->iov_footer->total_len);
-            mk_stream_in_cbuf(req->stream,
-                              NULL,
-                              tmp, len,
-                              NULL, NULL);
+            mk_api->stream_set(NULL,
+                               MK_STREAM_COPYBUF,
+                               channel,
+                               tmp, len, req, NULL, NULL, mk_dirhtml_cb_error);
             cb_ok  = NULL;
         }
         else {
             cb_ok  = mk_dirhtml_cb_complete;
         }
 
-        mk_stream_in_iov(req->stream,
-                         NULL,
-                         req->iov_footer,
-                         NULL, NULL);
+        /* No more rows to add, just link the page footer */
+        mk_api->stream_set(NULL,                   /* stream            */
+                           MK_STREAM_IOV,          /* type              */
+                           channel,                /* channel           */
+                           req->iov_footer,        /* buffer            */
+                           -1,                     /* buffer size       */
+                           req,                    /* custom data       */
+                           cb_ok,                  /* on_finish         */
+                           NULL,                   /* on_bytes_consumed */
+                           mk_dirhtml_cb_error);   /* on_error          */
+
         if (req->chunked) {
-            mk_stream_in_cbuf(req->stream,
-                              NULL,
-                              "\r\n0\r\n\r\n", 7,
-                              NULL, mk_dirhtml_cb_complete);
+            mk_api->stream_set(NULL,
+                               MK_STREAM_COPYBUF,
+                               channel,
+                               "\r\n0\r\n\r\n", 7, req,
+                               mk_dirhtml_cb_complete, NULL, mk_dirhtml_cb_error);
         }
 
         return;
@@ -692,26 +688,32 @@ void mk_dirhtml_cb_body_rows(struct mk_stream_input *in)
     if (req->chunked) {
         len = snprintf(tmp, sizeof(tmp), "%x\r\n",
                        (int) req->iov_entry->total_len);
-        mk_stream_in_cbuf(req->stream,
-                          NULL,
-                          tmp, len,
-                          NULL, NULL);
+        mk_api->stream_set(NULL,
+                           MK_STREAM_COPYBUF,
+                           channel,
+                           tmp, len, req, NULL, NULL, mk_dirhtml_cb_error);
         cb_ok = NULL;
     }
     else {
         cb_ok = mk_dirhtml_cb_body_rows;
     }
 
-    mk_stream_in_iov(req->stream,
-                     NULL,
-                     req->iov_entry,
-                     NULL, cb_ok);
+    mk_api->stream_set(NULL,
+                       MK_STREAM_IOV,
+                       channel,
+                       req->iov_entry,
+                       -1,
+                       req,
+                       cb_ok,
+                       NULL,
+                       mk_dirhtml_cb_error);
 
     if (req->chunked) {
-        mk_stream_in_cbuf(req->stream,
-                          NULL,
-                          "\r\n", 2,
-                          mk_dirhtml_cb_chunk_body_rows, NULL);
+        mk_api->stream_set(NULL,
+                           MK_STREAM_COPYBUF,
+                           channel,
+                           "\r\n", 2, (void *) req,
+                           mk_dirhtml_cb_body_rows, NULL, mk_dirhtml_cb_error);
     }
     req->toc_idx++;
 }
@@ -720,21 +722,19 @@ void mk_dirhtml_cb_body_rows(struct mk_stream_input *in)
  * The HTTP Headers were sent, now start registering the
  * rows for each directory entry.
  */
-void cb_header_finish(struct mk_stream_input *in)
+void cb_header_finish(struct mk_stream *stream)
 {
-    struct mk_stream *stream = in->stream;
     struct mk_dirhtml_request *req;
 
-    req = stream->context;
+    req = stream->data;
     if (req->iov_header) {
         mk_api->iov_free(req->iov_header);
         req->iov_header = NULL;
     }
-    mk_dirhtml_cb_body_rows(in);
+    mk_dirhtml_cb_body_rows(stream);
 }
 
-static int mk_dirhtml_init(struct mk_plugin *plugin,
-                           struct mk_http_session *cs, struct mk_http_request *sr)
+int mk_dirhtml_init(struct mk_http_session *cs, struct mk_http_request *sr)
 {
     DIR *dir;
     int len;
@@ -744,7 +744,6 @@ static int mk_dirhtml_init(struct mk_plugin *plugin,
     struct mk_list list;
     struct mk_f_list *entry;
     struct mk_dirhtml_request *request;
-    struct mk_stream *stream;
 
     if (!(dir = opendir(sr->real_path.data))) {
         return -1;
@@ -752,20 +751,6 @@ static int mk_dirhtml_init(struct mk_plugin *plugin,
 
     /* Create the main context */
     request = mk_api->mem_alloc(sizeof(struct mk_dirhtml_request));
-    if (!request) {
-        closedir(dir);
-        return -1;
-    }
-
-    stream = mk_stream_set(NULL, cs->channel, request,
-                           NULL, NULL, mk_dirhtml_cb_error);
-    if (!stream) {
-        closedir(dir);
-        free(request);
-        return -1;
-    }
-
-    request->stream  = stream;
     request->state   = MK_DIRHTML_STATE_HTTP_HEADER;
     request->dir     = dir;
     request->toc_idx = 0;
@@ -776,7 +761,6 @@ static int mk_dirhtml_init(struct mk_plugin *plugin,
     request->iov_header = NULL;
     request->iov_entry = NULL;
     request->iov_footer = NULL;
-
     sr->handler_data = request;
 
     request->file_list = mk_dirhtml_create_list(dir, sr->real_path.data,
@@ -834,27 +818,32 @@ static int mk_dirhtml_init(struct mk_plugin *plugin,
           mk_dirhtml_entry_cmp);
 
     /* Prepare HTTP response headers */
-    mk_api->header_prepare(plugin, cs, sr);
+    mk_api->header_prepare(cs, sr);
 
     if (request->chunked) {
         len = snprintf(tmp, sizeof(tmp), "%x\r\n",
                        (int) request->iov_header->total_len);
-        mk_stream_in_cbuf(request->stream,
-                          NULL,
-                          tmp, len,
-                          NULL, mk_dirhtml_cb_complete);
+        mk_api->stream_set(NULL,
+                           MK_STREAM_COPYBUF,
+                           cs->channel,
+                           tmp, len, request, NULL, NULL, mk_dirhtml_cb_error);
     }
 
-    mk_stream_in_iov(request->stream,
-                     NULL,
-                     request->iov_header,
-                     NULL, cb_header_finish);
+    mk_api->stream_set(NULL,                 /* stream            */
+                       MK_STREAM_IOV,        /* type              */
+                       cs->channel,          /* channel           */
+                       request->iov_header,  /* buffer            */
+                       -1,                   /* buffer size       */
+                       request,              /* custom data       */
+                       cb_header_finish,     /* on_finish         */
+                       NULL,                 /* on_bytes_consumed */
+                       mk_dirhtml_cb_error); /* on_error          */
 
     if (request->chunked) {
-        mk_stream_in_cbuf(request->stream,
-                          NULL,
-                          "\r\n", 2,
-                          NULL, NULL);
+        mk_api->stream_set(NULL,
+                           MK_STREAM_COPYBUF,
+                           cs->channel,
+                           "\r\n", 2, request, NULL, NULL, mk_dirhtml_cb_error);
     }
     return 0;
 }
@@ -895,7 +884,7 @@ int mk_dirlisting_stage30(struct mk_plugin *plugin,
     }
 
     PLUGIN_TRACE("Dirlisting attending socket %i", cs->socket);
-    if (mk_dirhtml_init(plugin, cs, sr)) {
+    if (mk_dirhtml_init(cs, sr)) {
         /*
          * If we failed here, we cannot return RET_END - that causes a mk_bug.
          * dirhtml_init only fails if opendir fails. Usually we're at full
